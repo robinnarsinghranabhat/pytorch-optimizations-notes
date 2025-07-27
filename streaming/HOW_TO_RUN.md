@@ -1,4 +1,4 @@
-## Click here :: [Main Article](https://github.com/robinnarsinghranabhat/pytorch-optimizations-notes/tree/main/streaming/article.md)
+## Click here :: [Main Article](https://github.com/robinnarsinghranabhat/pytorch-optimizations-notes/tree/main/streaming/README.md)
 
 ## Prerequities 
 1. `Nvidia Nsight Systems` profiler
