@@ -14,6 +14,7 @@ I also show how create a very simple bucketing strategy to collect gradients of 
 sending them for communication.
 
 """
+import time
 import torch
 import torch.nn as nn
 import os
@@ -38,10 +39,10 @@ class Bucket(object):
     """ 
     A Bucket to hold tensors for communication.
     This is a simplified version of the bucket used in DDP.
-    It holds upto a pre-defined (upto 2) number of tensors
+    It holds upto a pre-defined (upto 2) tensors
     then uses it for communication when full.
 
-    For our example, We have total 8 parameters (4 layers, each with 2 parameters - weight and bias).
+    For our example, We have total 8 Parameter Tensors (4 layers, each with weight and bias).
     So, we collect gradients of 2 parameters (1 layer) in the bucket before sending them for communication.
     """
 
@@ -120,11 +121,15 @@ class Net(nn.Module):
         super(Net, self).__init__()
         self.fc1 = nn.Linear(28*28, 256)
         self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, 10)
+        self.fc3 = nn.Linear(128, 128)
+        self.fc4 = nn.Linear(128, 128)
+        self.fc5 = nn.Linear(128, 128)
+        self.fc6 = nn.Linear(128, 128)
+        self.fc7 = nn.Linear(128, 128)
+        self.fc8 = nn.Linear(128, 10)
 
     def forward(self, x):
-        x = self.fc4(self.fc3(F.relu(self.fc2(F.relu(self.fc1(x))))))
+        x  = self.fc8(self.fc7(F.relu(self.fc6(F.relu(self.fc5(F.relu(self.fc4(F.relu(self.fc3(F.relu(self.fc2(F.relu(self.fc1(x))))))))))))))
         return F.log_softmax(x)
 
 
@@ -132,9 +137,10 @@ class Net(nn.Module):
 """ Distributed Asynchronous SGD Example """
 def run(rank, size):
     torch.manual_seed(1234)
+    device = torch.device("cuda:{}".format(rank))
     train_set, bsz = partition_dataset()
 
-    device = torch.device("cuda:{}".format(rank))
+
     model = Net().to(device)
     
 
@@ -150,8 +156,11 @@ def run(rank, size):
 
     num_batches = ceil(len(train_set.dataset) / float(bsz))
 
+    
+    times = []
     for epoch in range(10):
-        epoch_loss = 0.0
+        # epoch_loss = 0.0
+        start_time = time.time()
         for data, target in train_set:
             data, target = data.to(device), target.to(device)
             optimizer.zero_grad()
@@ -159,18 +168,22 @@ def run(rank, size):
 
             output = model(data)
             loss = F.nll_loss(output, target)
-            epoch_loss += loss.item()
+            # epoch_loss += loss.item()
             loss.backward() # Gradients are calculated here
 
             # Wait for all operations in communication queue to complete before updating the parameters
             torch.cuda.current_stream().wait_stream(comm_stream)
             torch.distributed.barrier()  # Ensure all processes reach this point before proceeding 
             optimizer.step()
+        
+        end_time = time.time()
+        diff = end_time - start_time
+        times.append(diff)
+        if rank == 0:
+            print('Rank ', dist.get_rank(), ', epoch ', epoch, ': ', diff)
 
-        print('Rank ', dist.get_rank(), ', epoch ',
-              epoch, ': ', epoch_loss / num_batches)
-
-
+    if rank == 0:
+        print('Rank ', dist.get_rank(), ', total time: ', sum(times))
 
 def init_process(rank, size, fn, backend='gloo'):
     """ Initialize the distributed environment. """
@@ -195,50 +208,3 @@ if __name__ == "__main__":
 
     for p in processes:
         p.join()
-
-
-
-### MY DDP RUN
-# Rank  1 , epoch  0 :  2.2392996650631143
-# Rank  0 , epoch  0 :  2.2396173760042353
-# Rank  1 , epoch  1 :  1.9120400719723458
-# Rank  0 , epoch  1 :  1.9134451575198417
-# Rank  1 , epoch  2 :  1.1675578184046989
-# Rank  0 , epoch  2 :  1.1716073498887531
-# Rank  1 , epoch  3 :  0.7390157832937726
-# Rank  0 , epoch  3 :  0.7463569843162925
-# Rank  1 , epoch  4 :  0.5698894686618093
-# Rank  0 , epoch  4 :  0.5788268734843044
-# Rank  1 , epoch  5 :  0.4829946756362915
-# Rank  0 , epoch  5 :  0.49047932988506254
-# Rank  1 , epoch  6 :  0.42881107330322266
-# Rank  0 , epoch  6 :  0.4380209380287235
-# Rank  1 , epoch  7 :  0.3939585039171122
-# Rank  0 , epoch  7 :  0.40175293411238716
-# Rank  1 , epoch  8 :  0.3683412898395021
-# Rank  0 , epoch  8 :  0.3754793713658543
-# Rank  1 , epoch  9 :  0.3487344929727457
-# Rank  0 , epoch  9 :  0.35489133303448306
-
-
-### ORIGNAL DDP RUN
-# Rank  0 , epoch  0 :  2.2396173760042353
-# Rank  1 , epoch  0 :  2.2392996650631143
-# Rank  0 , epoch  1 :  1.9134451575198417
-# Rank  1 , epoch  1 :  1.9120400719723458
-# Rank  0 , epoch  2 :  1.1716073498887531
-# Rank  1 , epoch  2 :  1.1675578184046989
-# Rank  0 , epoch  3 :  0.7463569843162925
-# Rank  1 , epoch  3 :  0.7390157832937726
-# Rank  0 , epoch  4 :  0.5788268734843044
-# Rank  1 , epoch  4 :  0.5698894686618093
-# Rank  0 , epoch  5 :  0.49047932988506254
-# Rank  1 , epoch  5 :  0.4829946756362915
-# Rank  0 , epoch  6 :  0.4380209380287235
-# Rank  1 , epoch  6 :  0.42881107330322266
-# Rank  0 , epoch  7 :  0.40175293411238716
-# Rank  1 , epoch  7 :  0.3939585039171122
-# Rank  0 , epoch  8 :  0.3754793713658543
-# Rank  1 , epoch  8 :  0.3683412898395021
-# Rank  0 , epoch  9 :  0.35489133303448306
-# Rank  1 , epoch  9 :  0.3487344929727457

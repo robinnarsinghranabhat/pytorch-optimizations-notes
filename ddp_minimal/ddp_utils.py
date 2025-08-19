@@ -54,5 +54,6 @@ def partition_dataset():
     partition = partition.use(dist.get_rank())
     train_set = torch.utils.data.DataLoader(partition,
                                          batch_size=bsz,
-                                         shuffle=True)
+                                         shuffle=True,
+                                         pin_memory=True)
     return train_set, bsz
