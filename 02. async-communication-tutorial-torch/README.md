@@ -6,6 +6,10 @@
 
 Since different hardware components handle these operations (DMA controllers handle data transfers while GPU cores handle computation), we can overlap these operations to maximize throughput.
 
+### Generating Profiler Visualization :  
+`torchrun --nproc_per_node=2 overlap_comm_compute.py`
+
+The output trace will be saved in the `./profiler_logs` directory. You can load this trace in Chrome by navigating to `chrome://tracing`.
 
 ### Environment
 This program was tested on a single node with two GPUs connected via PCIe bus.
@@ -27,12 +31,6 @@ The profiler visualization shows execution for one process (e.g., process 0 on G
 
 
 We don't concern with implementation detail of communication, but the fact that, while **Step 1** communication happens (GPU to CPU transfer), **Step 2** Data Transfer from CPU-GPU run in parallel. The matrix multiplication completes while the process waits for the updated `comm_tensor` from the host before final `matmul` Operation.
-
-
-### Generating Profiling Results :  
-`torchrun --nproc_per_node=2 overlap_comm_compute.py`
-
-The output trace will be saved in the `./profiler_logs` directory. You can load this trace in Chrome by navigating to `chrome://tracing`.
 
 ### Possible Performance Enchancements :
 - Consider NUMA Affinity : https://github.com/pytorch/pytorch/issues/115305 
