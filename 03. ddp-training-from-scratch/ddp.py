@@ -1,9 +1,10 @@
 """
-Last time, I talked about leveraging cuda streams to overlap independent `computations` and `data transfer` tasks.
-Remember, pytorch operations like torch.matmul(A,B) are queued as tasks in a "Default CUDA stream".
-All tasks in the same stream are executed in order, one after another; even if they are independent.
+In `01. cuda-stream-tutorial` and `02. async-communication-tutorial-torch`, I explained about leveraging cuda streams to 
+overlap independent `computations` and `data transfer | communication` tasks. Remember, pytorch operations invoked from 
+CPU side like `torch.matmul(A,B)` are queued as tasks in a "Default CUDA stream".
+All tasks in the same stream are executed in order, one after another; even if they don't have any dependency.
 
-This a minimal Distributed-Data-Parallel training in pytorch. Main goal is to show 
+Building on top of them, This a minimal Distributed-Data-Parallel training in pytorch. Main goal is to show 
 how to use multiple streams to overlap computation and communication requests made to CUDA.
 
 Basic Idea : During backward pass, after calculating gradients of Lth layer, an independent communication request is queued in a 
@@ -38,12 +39,12 @@ comm_stream = torch.cuda.Stream()
 class Bucket(object):
     """ 
     Naive Bucket implementation to hold tensors for communication.
-    This is a simplified version of the bucket used in DDP.
-    It holds upto a pre-defined (upto 2) tensors
-    then uses it for communication when full.
+    This is a simplified version of the bucket used in torch's DDP library.
+    It holds upto a pre-defined (2) tensors
+    then communicates them.
 
-    For our example, We have total 8 Parameter Tensors (4 layers, each with weight and bias).
-    So, we collect gradients of 2 parameters (1 layer) in the bucket before sending them for communication.
+    For our example, We have total 12 `Parameter` tensors (6 Linear layers, each with weight and bias).
+    So, during backward pass, we continue collecting information upto 2 parameters (1 layer) in the bucket before sending them for communication.
     """
 
     TENSOR_LIMIT = 2
@@ -79,7 +80,7 @@ class Bucket(object):
             # NOTE : This creates a new Tensor i.e allocates additional GPU memory
             merged_tensors = utils.parameters_to_vector(self.tensors)
             # Return both the merged tensor and the original tensor list
-            # original_tensors = self.tensors.copy()  # Keep a reference to original tensors
+            # Keep a reference to original tensors
             return merged_tensors, self.tensors
 
     def wait_for_pending_operations(self):
@@ -88,12 +89,12 @@ class Bucket(object):
         This should only be called before optimizer.step() to ensure all gradients are properly averaged.
         """
         for handle, merged_tensor, original_tensors in self.pending_operations:
-            # Wait for that `all_reduce` communication to finish 
+            # Program Execution Waits for this specific `all_reduce` communication to finish 
+            # CPU doesn't proceed until `merged_tensor` is updated by `all_reduce`
             handle.wait()
             
             # Only Now, it's safe to average and update gradients
             merged_tensor /= WORLD_SIZE
-
             # We kept reference to the original tensors, so we can update their gradients
             # with the averaged gradients.
             self.update_tensor_grads(merged_tensor, original_tensors)
@@ -123,8 +124,8 @@ def communication_hook(tensor):
             # CPU invokes an asynchronous all_reduce operation and immediately continues to next line
             handle = dist.all_reduce(merged_gradient_tensors, op=dist.ReduceOp.SUM, async_op=True)
             
-            # IMPORTANT: Don't process the tensor here! The all_reduce hasn't completed yet.
-            # Instead, store the handle and tensor for later processing.
+            # IMPORTANT: The all_reduce hasn't completed yet.
+            # Just store the handle and tensor for later processing.
             bucket.add_pending_operation(handle, merged_gradient_tensors, original_tensors)
 
         # Clear the bucket for next batch of tensors
