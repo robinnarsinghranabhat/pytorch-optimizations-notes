@@ -11,7 +11,7 @@ def setup_distributed():
     world_size = int(os.environ["WORLD_SIZE"])
 
     # Initialize the process group with the NCCL backend
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
     
     # Set the device for the current process
     torch.cuda.set_device(local_rank)
