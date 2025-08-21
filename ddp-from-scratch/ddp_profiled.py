@@ -1,25 +1,7 @@
 """
-Last time, I talked about levaraging cuda streams to overlap independent `computations` and `data transfer` tasks.
-Remember, pytorch operations like torch.matmul(A,B) are queued as tasks in a "Default CUDA stream".
-All tasks in the same stream are executed in order, one after another.
-
-Here, implemented a minimal Distributed-Data-Parallel training in pytorch. Main goal is to show 
-how to use multiple streams to overlap computation and communication requests made to CUDA.
-
-Basic Idea : During backward pass, after calculating gradients of Lth layer, an independent communication request is queued in a 
-separate stream to average gradients of Lth layer across all GPUs. At the same time, in our default stream, we continue with
-computing gradients for (L-1)th layer.
-
-I also show how create a very simple bucketing strategy to collect gradients of multiple tensors before 
-sending them for communication.
-
-PROFILING ADDED:
-- Uses PyTorch profiler to capture CUDA events and timeline
-- Records both computation and communication streams
-- Exports Chrome trace for visualization
-- Adds timing measurements for overlap analysis
-
+This is a profiled version to DEBUG ddp.py:
 """
+
 import torch
 import torch.nn as nn
 import os
@@ -37,32 +19,34 @@ from ddp_utils import partition_dataset
 
 WORLD_SIZE = 2
 
-# Create a CUDA stream for sending communication requests
+# This is a separate CUDA stream for sending communication requests
 comm_stream = torch.cuda.Stream()
 
 class Bucket(object):
     """ 
-    A Bucket to hold tensors for communication.
+    Naive Bucket implementation to hold tensors for communication.
     This is a simplified version of the bucket used in DDP.
-    It holds upto a pre-defined (upto 2) number of tensors
+    It holds upto a pre-defined (upto 2) tensors
     then uses it for communication when full.
 
-    For our example, We have total 8 parameters (4 layers, each with 2 parameters - weight and bias).
+    For our example, We have total 8 Parameter Tensors (4 layers, each with weight and bias).
     So, we collect gradients of 2 parameters (1 layer) in the bucket before sending them for communication.
     """
 
-    TENSOR_LIMIT = 2 # Default :  only collect 2 tensors in the bucket
+    TENSOR_LIMIT = 2
     def __init__(self, tensor_limit=TENSOR_LIMIT):
         self.tensors = []
         self.size = 0
+        # Store pending communication handles and their associated data
+        self.pending_operations = []
         
     def add(self, tensor):
         self.tensors.append(tensor)
         self.size += tensor.numel()
     
-    def update_tensor_grads(self, merged_tensors):
+    def update_tensor_grads(self, merged_tensors, original_tensors):
         # Unflatten the buffer back into the original tensors
-        utils.vector_to_parameters(merged_tensors, self.tensors)
+        utils.vector_to_parameters(merged_tensors, original_tensors)
 
     def clear(self):
         # Clear the bucket.
@@ -72,53 +56,68 @@ class Bucket(object):
     def collect_tensors(self, tensor):
         """ 
         Accumulate tensors in the bucket. If the bucket is full, 
-        return the concatenated tensor.
+        return the concatenated tensor to initiate the communication.
         """
         self.add(tensor)
         if len(self.tensors) < self.TENSOR_LIMIT:            
-            return
+            return None, None
         else:
             # Concatenate all tensors in the bucket into a single tensor
             # NOTE : This creates a new Tensor i.e allocates additional GPU memory
-            merged_tensors =  utils.parameters_to_vector(self.tensors)
-            return merged_tensors
+            merged_tensors = utils.parameters_to_vector(self.tensors)
+            # Return both the merged tensor and the original tensor list
+            # original_tensors = self.tensors.copy()  # Keep a reference to original tensors
+            return merged_tensors, self.tensors
+
+    def wait_for_pending_operations(self):
+        """
+        Wait for all pending communication operations to complete and update gradients.
+        This should only be called before optimizer.step() to ensure all gradients are properly averaged.
+        """
+        for handle, merged_tensor, original_tensors in self.pending_operations:
+            # Wait for that `all_reduce` communication to finish 
+            handle.wait()
+            
+            # Only Now, it's safe to average and update gradients
+            merged_tensor /= WORLD_SIZE
+
+            # We kept reference to the original tensors, so we can update their gradients
+            # with the averaged gradients.
+            self.update_tensor_grads(merged_tensor, original_tensors)
+        
+        # Clear pending operations
+        self.pending_operations.clear()
+
+    def add_pending_operation(self, handle, merged_tensor, original_tensors):
+        """Add a pending communication operation to track."""
+        self.pending_operations.append((handle, merged_tensor, original_tensors))
 
 
 bucket = Bucket()
 
 
 def communication_hook(tensor):
-    with torch.profiler.record_function("gradient_communication_hook"):
-        # NOTE : This is new copy in GPU memory.
-        merged_gradient_tensors = bucket.collect_tensors(tensor.grad)
+    # Collect tensors in the bucket
+    merged_gradient_tensors, original_tensors = bucket.collect_tensors(tensor.grad)
 
-        if merged_gradient_tensors is not None:
-            # Just ensuring that this tensor is not required to be tracked in autograd's computational graph"
-            assert merged_gradient_tensors.requires_grad == False
+    if merged_gradient_tensors is not None:
+        # Just explicitly ensuring that that this tensor is not required to be tracked in 
+        # the computational graph
+        assert merged_gradient_tensors.requires_grad == False
 
-            # We want CPU to queue the communication operation on a separate stream
-            # How this communication happens is not important to us. Based on backends used and hardware supported, 
-            # tensors could be communicated directly between GPUs (nvlink) or through the slower GPU-CPU-GPU path (PCIE).
-            with torch.cuda.stream(comm_stream):
-                with torch.profiler.record_function("allreduce_operation"):
-                    handle = dist.all_reduce(merged_gradient_tensors, op=dist.ReduceOp.SUM, async_op=True)
-                    # Wait ensures the operation is enqueued, but not necessarily complete.
-                    handle.wait()
-                    merged_gradient_tensors /= WORLD_SIZE
+        # We want CPU to queue the communication operation on a separate stream
+        with torch.cuda.stream(comm_stream):
+            # CPU invokes an asynchronous all_reduce operation and immediately continues to next line
+            handle = dist.all_reduce(merged_gradient_tensors, op=dist.ReduceOp.SUM, async_op=True)
+            
+            # IMPORTANT: Don't process the tensor here! The all_reduce hasn't completed yet.
+            # Instead, store the handle and tensor for later processing.
+            bucket.add_pending_operation(handle, merged_gradient_tensors, original_tensors)
 
-                with torch.profiler.record_function("update_bucket_gradients"):
-                    # Update the Pameters in the bucket with new averaged gradients
-                    # NOTE : Update below must also happen inside this same stream
-                    # Otherwise, we can't guarentee `merged_gradient_tensors` have been updated before
-                    # the operation below.
-                    bucket.update_tensor_grads(merged_gradient_tensors)
+        # Clear the bucket for next batch of tensors
+        bucket.clear()
 
-                    # if dist.get_rank() == 0:
-                    #     print(f"Communication done for Tensor of size {merged_gradient_tensors.numel()}")
-
-            bucket.clear()
-
-        return tensor
+    return tensor
 
 
 class Net(nn.Module):
@@ -126,24 +125,34 @@ class Net(nn.Module):
 
     def __init__(self):
         super(Net, self).__init__()
-        self.fc1 = nn.Linear(28*28, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, 10)
+        self.fc1 = nn.Linear(28*28, 2048)
+        self.fc2 = nn.Linear(2048, 2048)
+        self.drpout1 = nn.Dropout(0.3)
+        self.fc3 = nn.Linear(2048, 2048)
+        self.drpout2 = nn.Dropout(0.3)
+        self.fc4 = nn.Linear(2048, 2048)
+        self.drpout3 = nn.Dropout(0.3)
+        self.fc5 = nn.Linear(2048, 2048)
+        self.fc6 = nn.Linear(2048, 10)
 
     def forward(self, x):
-        x = self.fc4(self.fc3(F.relu(self.fc2(F.relu(self.fc1(x))))))
-        return F.log_softmax(x)
+        x = self.fc1(x)
+        x = self.drpout1(x)
+        x = self.fc2(x)
+        x = self.drpout2(x)
+        x = self.fc3(x)
+        x = self.drpout3(x)
+        x = self.fc4(x)
+        x = self.fc5(x)
+        x = self.fc6(x)
+        return F.log_softmax(x, dim=1)
 
-
-# for profiling
+### For Profiling the Program ###
 def trace_handler(p):
-    # output = p.key_averages().table(sort_by=sort_by_keyword, row_limit=10)
-    # print(output)
+
     print("\n\nExporting Chrome trace...")
     rank = dist.get_rank()
     f_name = f"./profiler_logs/rank_{rank}_" + str(p.step_num) + ".json"
-    # only save if file does not exist
     if not os.path.exists(f_name):
         p.export_chrome_trace(f_name)
     else:
@@ -226,10 +235,6 @@ def run(rank, size):
     print(f"\nProfiling complete for rank {rank}!")
     print(f"Check ./profiler_logs/ for Chrome traces")
 
-    # Print stream information
-    print(f"\nRank {rank} Stream Information:")
-
-
 
 def init_process(rank, size, fn, backend='gloo'):
     """ Initialize the distributed environment. """
@@ -251,12 +256,7 @@ if __name__ == "__main__":
         mp.get_context("spawn")
     else:
         mp.set_start_method("spawn")
-    
-    print("Starting DDP training with profiling...")
-    print("Profiling outputs:")
-    print("1. TensorBoard logs: ./profiler_logs/")
-    print("2. Chrome traces: ./ddp_trace_rank_X.json")
-    
+     
     for rank in range(world_size):
         p = mp.Process(target=init_process, args=(rank, world_size, run))
         p.start()
