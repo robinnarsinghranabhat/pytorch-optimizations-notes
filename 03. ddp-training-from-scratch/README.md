@@ -10,8 +10,6 @@ Single node with two gpus connected over PCIE , so not direct GPU-GPU data trans
 
 
 ## Implemention Details
-Back in high school, we used to joke about math teachers solving that first simple example, then assigning whole chapter homework.
-
 I had covered the fundamentals on **[CUDA Streams](https://github.com/robinnarsinghranabhat/pytorch-optimizations-notes/tree/main/01.%20cuda-stream-tutorial)** and **[Communication-Computation Overlap](https://github.com/robinnarsinghranabhat/pytorch-optimizations-notes/tree/main/02.%20async-communication-tutorial-torch)**.
 
 To build something more substantial ( while i still had an access to multi-gpu node), implemented a **minimal, pedagogical DDP that overlaps gradient communication during backpropagation**. I extend on top of [This](https://docs.pytorch.org/tutorials/intermediate/dist_tuto.html) official pytorch article by Seb Arnold. Key Difference is : instead of averaging gradients across GPUs only after `loss.backward()` completes, we start communicating gradients as soon as they're computed for each layer.
