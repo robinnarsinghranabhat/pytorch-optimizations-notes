@@ -1,4 +1,4 @@
-### How to Overlap Communication and Computation in PyTorch 
+## How to Overlap Communication and Computation in PyTorch 
 
 **Communication** primarily involves data transfers between CPU and GPU, GPU to GPU within the same machine, or across different machines.
 
@@ -15,7 +15,7 @@ The output trace will be saved in the `./profiler_logs` directory. You can load 
 This program was tested on a single node with two GPUs connected via PCIe bus.
 
 
-### Understanding the Program with Torch Profiler Visualizations
+## Understanding the Program with Torch Profiler Visualizations
 The program launches two separate PyTorch processes, each utilizing one GPU. Each process initializes a `comm_tensor` that needs to be updated with the sum of `comm_tensor` values from both processes using the `all_reduce` collective operation.
 
 
@@ -32,5 +32,5 @@ The profiler visualization shows execution for one process (e.g., process 0 on G
 
 We don't concern with implementation detail of communication, but the fact that, while **Step 1** communication happens (GPU to CPU transfer), **Step 2** Data Transfer from CPU-GPU run in parallel. The matrix multiplication completes while the process waits for the updated `comm_tensor` from the host before final `matmul` Operation.
 
-### Possible Performance Enchancements :
+## Possible Performance Enchancements :
 - Consider NUMA Affinity : https://github.com/pytorch/pytorch/issues/115305 
